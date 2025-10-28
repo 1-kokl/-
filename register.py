@@ -6,7 +6,7 @@ import string
 import sqlite3
 import os
 import subprocess
-
+from RSA_crypto import RSAServices
 # 本地文档路径（存储用户信息）
 LOCAL_DOC = "user_registry.txt"
 # 需忽略的敏感文件（防止GitHub泄露密码数据）
@@ -18,7 +18,8 @@ def write_to_doc(user_info):
     with open(LOCAL_DOC, "a", encoding="utf-8") as f:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         # 存储哈希后的密码，不存明文
-        doc_line = f"{timestamp}|{user_info['username']}|{user_info['pwd_hash']}|{user_info['phone']}\n"
+        doc_line = (f"{timestamp}|{user_info['username']}|{user_info['pwd_hash']}|"
+                    f"{user_info['phone_encrypted']}|{user_info.get('email_encrypted', '')}\n")
         f.write(doc_line)
     print(f"用户信息已保存到本地文档：{LOCAL_DOC}")
 
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     fail_count INTEGER DEFAULT 0,
+    phone_encrypted TEXT NOT NULL,
     phone TEXT NOT NULL
 )
 ''')
@@ -153,28 +155,40 @@ def register():
     if not phone_valid:
         print(phone_msg)
         return
+        # 初始化RSA服务
+    rsa_service = RSAServices()
+    rsa_service.load_keys(e=65537)
 
-    # 1. 写入SQLite数据库（原有逻辑）
+    # 加密敏感信息
+    try:
+        encrypted_phone = rsa_service.encrypt(phone)
+        print("✅ 敏感信息加密完成")
+        print(f"加密手机号: {encrypted_phone[:30]}...")
+    except Exception as e:
+        print(f"❌ 加密失败: {e}")
+        return
+
+    # 1. 写入SQLite数据库
     try:
         cursor.execute('''
-        INSERT INTO users (username, password_hash, phone)
-        VALUES (?, ?, ?)
-        ''', (username, password_hash, phone))
+                INSERT INTO users (username, password_hash,phone, phone_encrypted)
+                VALUES (?, ?, ?, ?)
+                ''', (username, password_hash,phone, encrypted_phone))
         conn.commit()
-        print("注册成功！数据已写入SQLite数据库")
+        print("注册成功！加密数据已写入SQLite数据库")
     except sqlite3.IntegrityError:
         print("用户名已存在")
         return
 
-    # 2. 写入本地文档（新增逻辑）
+    # 2. 写入本地文档
     user_info = {
         "username": username,
         "pwd_hash": password_hash,
-        "phone": phone
+        "phone_encrypted": encrypted_phone,
     }
     write_to_doc(user_info)
 
-    # 3. 提示GitHub同步（新增逻辑）
+    # 3. 提示GitHub同步
     sync_to_github()
 
 
@@ -233,15 +247,16 @@ def login():
     print("=== 用户登录 ===")
     username = input("请输入用户名：")
     cursor.execute('''
-    SELECT password_hash, fail_count
-    FROM users
-    WHERE username = ?
-    ''', (username,))
+       SELECT password_hash, phone_encrypted, fail_count
+       FROM users
+       WHERE username = ?
+       ''', (username,))
+
     user = cursor.fetchone()
     if not user:
         print("用户名不存在")
         return
-    password_hash, fail_count = user
+    password_hash, encrypted_phone, fail_count = user
 
     if fail_count >= 5:
         print("账户已锁定，请1小时后重试")
@@ -268,6 +283,13 @@ def login():
     ''', (username,))
     conn.commit()
     print("登录成功！")
+    rsa_service = RSAServices()
+    rsa_service.load_keys(65537)
+    try:
+        decrypted_phone = rsa_service.decrypt(encrypted_phone)
+        print(f"📱 您的手机号: {decrypted_phone}")
+    except Exception as e:
+        print(f"⚠️ 信息显示失败: {e}")
 
     client_ip = input("请输入客户端IP（模拟）：")
     user_agent = input("请输入User-Agent（模拟，如Mozilla/5.0）：")
