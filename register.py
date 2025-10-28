@@ -7,6 +7,7 @@ import sqlite3
 import os
 import subprocess
 from RSA_crypto import RSAServices
+from JWT_Utils import JWTService
 # 本地文档路径（存储用户信息）
 LOCAL_DOC = "user_registry.txt"
 # 需忽略的敏感文件（防止GitHub泄露密码数据）
@@ -112,13 +113,16 @@ cursor = conn.cursor()
 # 创建用户表
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    fail_count INTEGER DEFAULT 0,
-    phone_encrypted TEXT NOT NULL,
-    phone TEXT NOT NULL
+    username TEXT PRIMARY KEY, 
+    password_hash TEXT NOT NULL,  
+    fail_count INTEGER DEFAULT 0, 
+    last_fail_time REAL DEFAULT 0, 
+    role TEXT NOT NULL DEFAULT 'buyer',  
+    phone_encrypted TEXT NOT NULL, 
+    phone TEXT NOT NULL  
 )
 ''')
+conn.commit()
 
 # 创建会话表
 cursor.execute('''
@@ -246,57 +250,79 @@ def verify_session(session_id, client_ip, user_agent):
 def login():
     print("=== 用户登录 ===")
     username = input("请输入用户名：")
-    cursor.execute('''
-       SELECT password_hash, phone_encrypted, fail_count
-       FROM users
-       WHERE username = ?
-       ''', (username,))
+    password = input("请输入密码：")
 
+    # 1. 查询用户信息（含失败次数、角色）
+    cursor.execute('''
+        SELECT password_hash, fail_count, last_fail_time, role 
+        FROM users 
+        WHERE username = ?
+    ''', (username,))
     user = cursor.fetchone()
     if not user:
-        print("用户名不存在")
+        print("❌ 用户名不存在")
         return
-    password_hash, encrypted_phone, fail_count = user
+    password_hash, fail_count, last_fail_time, role = user
 
+    # 2. 防暴力破解：失败5次锁定1小时
     if fail_count >= 5:
-        print("账户已锁定，请1小时后重试")
-        return
+        # 计算锁定剩余时间（当前时间 - 最后一次失败时间 < 3600秒则仍锁定）
+        if time.time() - last_fail_time < 3600:
+            remaining = int(3600 - (time.time() - last_fail_time))
+            print(f"❌ 账户已锁定，剩余{remaining}秒后可重试")
+            return
+        else:
+            # 锁定时间过后，重置失败次数
+            cursor.execute('''
+                UPDATE users 
+                SET fail_count = 0, last_fail_time = 0 
+                WHERE username = ?
+            ''', (username,))
+            conn.commit()
 
-    password = input("请输入密码：")
-    input_password_hash = hash_password(password)
-    if input_password_hash != password_hash:
+    # 3. 验证密码
+    input_hash = hash_password(password)  # 复用你已有的密码哈希函数
+    if input_hash != password_hash:
+        # 记录失败次数和时间
+        new_fail_count = fail_count + 1
         cursor.execute('''
-        UPDATE users
-        SET fail_count = fail_count + 1
-        WHERE username = ?
-        ''', (username,))
+            UPDATE users 
+            SET fail_count = ?, last_fail_time = ? 
+            WHERE username = ?
+        ''', (new_fail_count, time.time(), username))
         conn.commit()
-        remaining = 5 - (fail_count + 1)
-        print(f"账号或密码错误，剩余尝试次数：{remaining}")
+        print(f"❌ 密码错误，剩余尝试次数：{5 - new_fail_count}")
         return
 
-    # 登录成功，重置失败次数
+    # 4. 登录成功：重置失败次数 + 生成JWT Token
     cursor.execute('''
-    UPDATE users
-    SET fail_count = 0
-    WHERE username = ?
+        UPDATE users 
+        SET fail_count = 0, last_fail_time = 0 
+        WHERE username = ?
     ''', (username,))
     conn.commit()
-    print("登录成功！")
-    rsa_service = RSAServices()
-    rsa_service.load_keys(65537)
-    try:
-        decrypted_phone = rsa_service.decrypt(encrypted_phone)
-        print(f"📱 您的手机号: {decrypted_phone}")
-    except Exception as e:
-        print(f"⚠️ 信息显示失败: {e}")
+    print("✅ 登录成功！")
 
-    client_ip = input("请输入客户端IP（模拟）：")
-    user_agent = input("请输入User-Agent（模拟，如Mozilla/5.0）：")
-    session_id = init_session(username, client_ip, user_agent)
+    # 5. 生成JWT令牌（替换原有Session）
+    jwt_service = JWTService()
+    tokens = jwt_service.generate_token(username, role)
+    print("\n📌 JWT令牌信息：")
+    print(f"访问令牌（2小时有效）：{tokens['access_token'][:40]}...")  # 脱敏显示
+    print(f"刷新令牌（7天有效）：{tokens['refresh_token'][:40]}...")
 
-    verify_result, verify_msg = verify_session(session_id, client_ip, user_agent)
-    print(verify_msg)
+    # 6. 验证Token并展示角色权限
+    verify_ok, result = jwt_service.verify_token(tokens['access_token'])
+    if verify_ok:
+        print(f"\n🔍 当前用户：{result['username']}，角色：{result['role']}")
+        # 角色权限示例（后续可扩展）
+        if role == "admin":
+            print("📊 权限：可管理所有用户和订单")
+        elif role == "seller":
+            print("🏪 权限：可管理自己的商品和店铺")
+        else:
+            print("🛒 权限：可浏览商品和下单")
+    else:
+        print(f"❌ Token验证失败：{result}")
 
 
 # -------------------------- 主程序：启动时配置.gitignore --------------------------

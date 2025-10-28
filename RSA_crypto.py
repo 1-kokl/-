@@ -49,6 +49,7 @@ def gra_pra_pub_key(e= 65537) :
         "type" : "private",
         "n" : n,
         "d" : d,
+        'e': e,
         "key_size": 1024
     }
     public_key = {
